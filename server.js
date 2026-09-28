@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '[REDACTED_BOT_TOKEN_1]';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 
 // Honeypot logs in-memory storage (max 1000 items)
