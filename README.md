@@ -1,12 +1,18 @@
-# UzPay Billing & Checkout Gateway
+# UzPay Automated Billing & Payment Gateway
 
-Node.js SDK & Telegram Webhook integration for UzPay automated payments.
+Production Node.js service for automated billing and Telegram payment bot integration.
 
-## Configuration
-```javascript
-const express = require('express');
-const app = express();
+## Deployment on Render
+Deploy using the included `render.yaml` Blueprint or manual web service.
 
-const TELEGRAM_BOT_TOKEN = "[REDACTED_BOT_TOKEN_2]";
-const MERCHANT_ID = "uzpay_live_94827104";
-```
+### Environment Variables
+- `PORT` - Port number (default: 3000)
+- `TELEGRAM_BOT_TOKEN` - Telegram Bot token from @BotFather
+- `GEMINI_API_KEY` - Google Gemini AI API key
+
+## API Endpoints
+- `GET /` - Gateway Status
+- `GET /api/payments/status` - Payment gateway health check
+- `GET /api/honeypot/logs` - Honeypot and hacker interaction logs
+- `POST /api/honeypot/clear` - Clear logs
+- `POST /webhook/telegram` - Telegram Webhook receiver (optional)
