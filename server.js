@@ -1,6 +1,8 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
@@ -8,28 +10,52 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '[REDACTED_BOT_TOKEN_1]';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const AUDIT_SECRET = process.env.AUDIT_SECRET || 'uzpay-sec-ops-key';
+const AUDIT_LOG_FILE = process.env.AUDIT_LOG_FILE || path.join('/tmp', 'uzpay_gateway_audit.log');
 
-// Honeypot logs in-memory storage (max 1000 items)
-const honeypotLogs = [];
+// Persistent audit logs storage (in-memory + append-only file)
+const auditLogs = [];
 const MAX_LOGS = 1000;
 
-function addHoneypotLog(logEntry) {
+// Load persisted logs on startup
+try {
+  if (fs.existsSync(AUDIT_LOG_FILE)) {
+    const lines = fs.readFileSync(AUDIT_LOG_FILE, 'utf-8').trim().split('\n');
+    for (const line of lines.slice(-MAX_LOGS)) {
+      if (line) {
+        try {
+          auditLogs.unshift(JSON.parse(line));
+        } catch (e) {}
+      }
+    }
+    console.log(`[UzPay Gateway] Loaded ${auditLogs.length} audit events from persistent storage.`);
+  }
+} catch (e) {
+  console.warn('[UzPay Gateway] Could not load prior audit logs:', e.message);
+}
+
+function addAuditLog(logEntry) {
   const entry = {
     id: Date.now() + '-' + Math.random().toString(36).substr(2, 9),
     timestamp: new Date().toISOString(),
     ...logEntry
   };
-  honeypotLogs.unshift(entry);
-  if (honeypotLogs.length > MAX_LOGS) {
-    honeypotLogs.pop();
+  auditLogs.unshift(entry);
+  if (auditLogs.length > MAX_LOGS) {
+    auditLogs.pop();
+  }
+  try {
+    fs.appendFileSync(AUDIT_LOG_FILE, JSON.stringify(entry) + '\n', 'utf-8');
+  } catch (err) {
+    console.error('[UzPay Gateway] Failed to write audit event:', err.message);
   }
   return entry;
 }
 
-// Request logging middleware for honeypot tracking
+// Request logging middleware for telemetry
 app.use((req, res, next) => {
-  if (!req.path.startsWith('/api/honeypot/logs')) {
-    addHoneypotLog({
+  if (!req.path.startsWith('/api/v2/telemetry') && !req.path.startsWith('/api/gateway/internal-audit')) {
+    addAuditLog({
       type: 'http_request',
       method: req.method,
       path: req.path,
@@ -62,12 +88,26 @@ app.get('/api/payments/status', (req, res) => {
   });
 });
 
-// Honeypot Logs API
-app.get('/api/honeypot/logs', (req, res) => {
+// Internal Telemetry & Audit API (Token-authenticated)
+function authenticateAudit(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const tokenHeader = req.headers['x-gateway-key'] || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7) : '';
+
+  if (tokenHeader === AUDIT_SECRET || bearerToken === AUDIT_SECRET || req.query.key === AUDIT_SECRET) {
+    return next();
+  }
+  return res.status(401).json({
+    error: 'Unauthorized',
+    message: 'Valid x-gateway-key header or Bearer token required for telemetry access.'
+  });
+}
+
+app.get(['/api/v2/telemetry/metrics', '/api/gateway/internal-audit'], authenticateAudit, (req, res) => {
   const limit = parseInt(req.query.limit, 10) || 100;
   const type = req.query.type;
   
-  let results = honeypotLogs;
+  let results = auditLogs;
   if (type) {
     results = results.filter(log => log.type === type);
   }
@@ -79,12 +119,7 @@ app.get('/api/honeypot/logs', (req, res) => {
   });
 });
 
-app.post('/api/honeypot/clear', (req, res) => {
-  honeypotLogs.length = 0;
-  res.json({ success: true, message: 'Logs cleared successfully' });
-});
-
-// Gemini AI Persona Generator for UzPay Honeypot
+// AI Assistant Integration for UzPay Checkout
 async function askGemini(userMessage, userInfo) {
   if (!GEMINI_API_KEY) {
     return "UzPay To'lov Gateway: So'rovingiz qabul qilindi. Operator tez orada bog'lanadi.";
@@ -98,51 +133,41 @@ Vazifangiz:
 4. Javoblaringiz lo'nda, o'zbek tilida (yoki foydalanuvchi murojaat qilgan tilda) va biznes uslubida bo'lsin.`;
 
   try {
+    const payload = {
+      contents: [
+        {
+          role: "user",
+          parts: [
+            { text: `[Mijoz Ma'lumoti: ${JSON.stringify(userInfo)}]\nMurojaat: ${userMessage}` }
+          ]
+        }
+      ],
+      systemInstruction: {
+        parts: [{ text: systemInstruction }]
+      },
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 600
+      }
+    };
+
     const response = await axios.post(
       `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: `Foydalanuvchi (${userInfo.first_name || 'Mijoz'} @${userInfo.username || 'noma\'lum'}): ${userMessage}` }]
-          }
-        ],
-        systemInstruction: {
-          parts: [{ text: systemInstruction }]
-        }
-      },
+      payload,
       {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 15000
+        timeout: 20000
       }
     );
 
-    const candidate = response.data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    return candidate || "UzPay Billing: So'rovingiz ko'rib chiqilmoqda.";
-  } catch (err) {
-    console.error('Gemini API Error:', err.response?.data || err.message);
-    // Fallback if gemini-2.5-flash endpoint differs or fails
-    try {
-      const fallbackResponse = await axios.post(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          contents: [
-            {
-              role: 'user',
-              parts: [{ text: `${systemInstruction}\n\nMijoz xabari: ${userMessage}` }]
-            }
-          ]
-        },
-        {
-          headers: { 'Content-Type': 'application/json' },
-          timeout: 15000
-        }
-      );
-      return fallbackResponse.data?.candidates?.[0]?.content?.parts?.[0]?.text || "UzPay to'lov xizmati: Tizim faol rejimda.";
-    } catch (fallbackErr) {
-      console.error('Fallback Gemini Error:', fallbackErr.response?.data || fallbackErr.message);
-      return "UzPay To'lov Gateway: So'rovingiz qabul qilindi. Tez orada hisob-kitob bo'limi siz bilan bog'lanadi.";
+    const candidates = response.data?.candidates;
+    if (candidates && candidates.length > 0 && candidates[0].content?.parts?.[0]?.text) {
+      return candidates[0].content.parts[0].text.trim();
     }
+    return "UzPay Gateway: So'rovingiz qayta ishlanmoqda.";
+  } catch (error) {
+    console.error('[UzPay Gateway] AI Assistant Error:', error.response?.data || error.message);
+    return "UzPay To'lov Gateway: Hozirda tizim yangilanmoqda. Iltimos, keyinroq qayta urinib ko'ring.";
   }
 }
 
@@ -154,59 +179,48 @@ async function sendTelegramMessage(chatId, text) {
       `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
       {
         chat_id: chatId,
-        text: text,
-        parse_mode: 'Markdown'
+        text: text
       },
       { timeout: 10000 }
     );
   } catch (err) {
-    // If Markdown fails, retry with plain text
-    try {
-      await axios.post(
-        `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
-        {
-          chat_id: chatId,
-          text: text
-        },
-        { timeout: 10000 }
-      );
-    } catch (retryErr) {
-      console.error('Failed to send Telegram message:', retryErr.response?.data || retryErr.message);
-    }
+    console.error('[UzPay Gateway] Telegram send error:', err.response?.data || err.message);
   }
 }
 
-// Process incoming Telegram update
+// Telegram Update Processor
 async function processTelegramUpdate(update) {
   const message = update.message || update.edited_message || update.channel_post;
   if (!message) return;
 
   const chatId = message.chat?.id;
   const user = message.from || {};
-  const text = message.text || message.caption || '[Fayl/Media]';
+  const text = message.text || message.caption || '[Non-text payload]';
 
-  // Log incoming hacker/user message into honeypot logs
-  const loggedEntry = addHoneypotLog({
-    type: 'telegram_hacker_message',
+  // Log incoming interaction
+  addAuditLog({
+    type: 'telegram_incoming_message',
     update_id: update.update_id,
     chat_id: chatId,
-    user_id: user.id,
-    username: user.username,
-    first_name: user.first_name,
-    last_name: user.last_name,
-    is_bot: user.is_bot,
-    language_code: user.language_code,
-    message_text: text,
+    chat_type: message.chat?.type,
+    from: {
+      id: user.id,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      username: user.username,
+      language_code: user.language_code
+    },
+    text: text,
     raw_message: message
   });
 
-  console.log(`[HONEYPOT CAPTURE] From @${user.username || user.id}: "${text}"`);
+  console.log(`[UzPay Gateway] Message from @${user.username || user.id}: "${text}"`);
 
   // Generate response with Gemini
   const botReply = await askGemini(text, user);
 
   // Log outgoing response
-  addHoneypotLog({
+  addAuditLog({
     type: 'telegram_bot_response',
     chat_id: chatId,
     reply_to_user: user.username || user.id,
@@ -226,18 +240,18 @@ app.post('/webhook/telegram', async (req, res) => {
   }
 });
 
-// Telegram Long Polling Worker (if webhook not configured)
+// Telegram Long Polling Worker
 let lastUpdateId = 0;
 let isPolling = false;
 
 async function pollTelegramUpdates() {
   if (!TELEGRAM_BOT_TOKEN) {
-    console.warn('TELEGRAM_BOT_TOKEN not configured. Polling disabled.');
+    console.warn('[UzPay Gateway] TELEGRAM_BOT_TOKEN not configured. Polling disabled.');
     return;
   }
 
   isPolling = true;
-  console.log('Telegram Honeypot Polling started...');
+  console.log('[UzPay Gateway] Telegram polling worker started...');
 
   while (isPolling) {
     try {
@@ -259,10 +273,17 @@ async function pollTelegramUpdates() {
       }
     } catch (err) {
       if (err.response?.status === 409) {
-        console.warn('Telegram conflict (409): Webhook might be active or another poller is running.');
+        addAuditLog({
+          type: 'TOKEN_CONFLICT_409',
+          severity: 'CRITICAL',
+          title: 'Potential Token Hijack Detected',
+          message: 'Telegram API 409 Conflict: Bot token is being actively used by another server/webhook/poller.',
+          details: err.response?.data || err.message
+        });
+        console.warn('🚨 [UzPay Gateway Audit]: 409 Conflict registered in audit logs!');
         await new Promise(resolve => setTimeout(resolve, 10000));
       } else {
-        console.error('Polling error:', err.message);
+        console.error('[UzPay Gateway] Polling error:', err.message);
         await new Promise(resolve => setTimeout(resolve, 5000));
       }
     }
@@ -271,10 +292,10 @@ async function pollTelegramUpdates() {
 
 // Start Server
 app.listen(PORT, () => {
-  console.log(`UzPay Honeypot Gateway running on port ${PORT}`);
+  console.log(`UzPay Automated Billing Gateway running on port ${PORT}`);
   if (TELEGRAM_BOT_TOKEN) {
     pollTelegramUpdates();
   } else {
-    console.log('Running in standalone API mode (Set TELEGRAM_BOT_TOKEN to enable bot).');
+    console.log('[UzPay Gateway] Running in standalone API mode.');
   }
 });
